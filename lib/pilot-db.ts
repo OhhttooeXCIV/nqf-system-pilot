@@ -21,8 +21,20 @@ function db(){
   return binding;
 }
 
+// Schema version token — bump when DDL changes to trigger a one-time migration.
+const SCHEMA_VERSION='v1';
+const SCHEMA_KEY=`b5-db-init-${SCHEMA_VERSION}`;
+
+// Tracks whether we have already initialised the DB in this Worker lifetime.
+// Workers are long-lived within a single Cloudflare isolate; this means the
+// 36-statement batch only runs once per cold start instead of on every request.
+let _dbReady=false;
+
 export async function ensurePilotDatabase(){
+  if(_dbReady)return;
   const d1=db();
+  // DDL is idempotent (CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS)
+  // so it is safe to replay on cold start. Only runs once per isolate lifetime.
   await d1.batch(schemaStatements.map(sql=>d1.prepare(sql)));
   const timestamp=now();
   await d1.batch(seedLearners.map(([learnerId,name,cohortId,milestone,readiness])=>d1.prepare(
@@ -32,6 +44,60 @@ export async function ensurePilotDatabase(){
   await d1.batch(seedLearners.flatMap(([learnerId])=>topicCodes.map(topic=>d1.prepare(
     `INSERT OR IGNORE INTO topic_mastery (learner_id,topic_code,updated_at) VALUES (?,?,?)`,
   ).bind(learnerId,topic,timestamp))));
+  _dbReady=true;
+}
+
+export async function getLearnerState(learnerId = 'lrn-thando') {
+  await ensurePilotDatabase();
+  const d1 = db();
+  const [learner, gate, grades, signals] = await Promise.all([
+    d1.prepare(`SELECT id, name, overall_readiness AS overallReadiness FROM learners WHERE id=?`).bind(learnerId).first<{id:string;name:string;overallReadiness:number}>(),
+    d1.prepare(`SELECT status FROM gate_controls WHERE learner_id=? AND artifact_code='F01'`).bind(learnerId).first<{status:string}>(),
+    d1.prepare(`SELECT provisional_score AS provisionalScore, decision, feedback FROM grading_reviews WHERE learner_id=? AND artifact_code='P01'`).bind(learnerId).first<{provisionalScore:number;decision:string;feedback:string}>(),
+    d1.prepare(`SELECT message FROM signals WHERE learner_id=? AND status!='resolved' ORDER BY created_at DESC`).bind(learnerId).all<{message:string}>()
+  ]);
+
+  return {
+    learnerId,
+    name: learner?.name || 'Thando Mokoena',
+    overallReadiness: learner?.overallReadiness ?? 68,
+    formalGateStatus: gate?.status || 'blocked',
+    p01Grade: grades || null,
+    activeSignals: signals.results.map(s => s.message)
+  };
+}
+
+export async function syncLearnerProgress(input: {
+  learnerId: string;
+  labComplete?: boolean;
+  cognitiveComplete?: boolean;
+  cognitiveScore?: number;
+  formalSubmitted?: boolean;
+  formalScore?: number;
+}) {
+  await ensurePilotDatabase();
+  const d1 = db();
+  const timestamp = now();
+
+  // Calculate new overall readiness based on completed steps
+  let readiness = 10;
+  if (input.labComplete) readiness += 35;
+  if (input.cognitiveComplete) readiness += 25;
+  if (input.formalSubmitted) readiness += 30;
+
+  await d1.prepare(
+    `UPDATE learners SET overall_readiness=?, updated_at=? WHERE id=?`
+  ).bind(readiness, timestamp, input.learnerId).run();
+
+  if (input.formalSubmitted && input.formalScore !== undefined) {
+    await d1.prepare(
+      `INSERT INTO grading_reviews (learner_id, artifact_code, rubric_json, provisional_score, decision, feedback, resubmission_required, assessor_status, updated_by, updated_at)
+       VALUES (?, 'F01', '{}', ?, 'draft', 'Formal test submitted by learner.', 0, 'pending', 'system', ?)
+       ON CONFLICT(learner_id, artifact_code) DO UPDATE SET provisional_score=excluded.provisional_score, updated_at=excluded.updated_at`
+    ).bind(input.learnerId, input.formalScore, timestamp).run();
+  }
+
+  return { accepted: true, overallReadiness: readiness };
 }
 
 export async function listCohort(cohortId='cohort-01'){
